@@ -1,0 +1,10 @@
+/**
+ * @file
+ * Form styling
+ */
+
+label[for=edit-commerce-payment-payment-method-commerce-emporikicommerce-payment-commerce-emporiki] {
+  display: inline-block;
+  height: 122px;
+  background: url("../images/alphabank2.jpg") no-repeat left bottom;
+}

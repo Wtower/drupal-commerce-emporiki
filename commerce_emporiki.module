@@ -1,0 +1,239 @@
+<?php
+/**
+ * @file
+ * Provides Redirection Payment method with Emporiki for Drupal Commerce.
+ *
+ * @see http://www.drupalcommerce.org/developer-guide/utilizing-core-apis/writing-payment-method-module
+ * @see https://www.drupal.org/project/commerce_paypal
+ * @see https://www.drupal.org/project/commerce_alphabank_redirect
+ * @see https://www.drupal.org/node/2293649#comment-8921337
+ * @see http://api.drupalcommerce.org/api/Drupal%20Commerce/sites%21all%21modules%21commerce%21modules%21payment%21includes%21commerce_payment.checkout_pane.inc/function/commerce_payment_redirect_pane_checkout_form/DC
+ */
+
+/**
+ * Implements hook_menu().
+ */
+function commerce_emporiki_menu() {
+  $items = array();
+  $items['checkout/emporiki/success'] = array(
+    'title' => 'Order complete',
+    'page callback' => 'commerce_emporiki_process',
+    'page arguments' => array(2), // 'success'
+    'access callback' => TRUE,
+    'type' => MENU_CALLBACK,
+    'file' => 'commerce_emporiki.pages.inc',
+  );
+  $items['checkout/emporiki/fail'] = array(
+    'title' => 'Order NOT complete',
+    'page callback' => 'commerce_emporiki_process',
+    'page arguments' => array(2), // 'fail'
+    'access callback' => TRUE,
+    'type' => MENU_CALLBACK,
+    'file' => 'commerce_emporiki.pages.inc',
+  );
+  return $items;
+}
+
+/**
+ * Implements hook_commerce_payment_method_info().
+ *
+ * @see http://drupalcontrib.org/api/drupal/contributions!commerce!modules!payment!commerce_payment.api.php/function/hook_commerce_payment_method_info/7
+ */
+function commerce_emporiki_commerce_payment_method_info() {
+  $payment_methods = array();
+  $payment_methods['commerce_emporiki'] = array(
+    'base' => 'commerce_emporiki',
+    'title' => t('Credit card on a secure environment provided by Alphabank Greece'),
+    'display' => t('Credit card (Alphabank)'),
+    'short_title' => t('Alphabank'),
+    'description' => t('Integration with Alphabank using redirection.'),
+    'active' => TRUE,
+    'offsite' => TRUE,
+    'offsite_autoredirect' => TRUE,
+  );
+  return $payment_methods;
+}
+
+/**
+ * Settings form, used to set vendor name and secret key within Rules settings.
+ */
+function commerce_emporiki_settings_form($settings = NULL) {
+  $form = array();
+  // Merge default settings into the stored settings array.
+  $settings = (array) $settings + array(
+    'merchant_code' => '',
+    'shared_secret_key' => '',
+    'post_url' => ' https://alpha.test.modirum.com/vpos/shophandlermpi',
+    'transaction_type' => COMMERCE_CREDIT_AUTH_CAPTURE,
+    'allow_installments' => FALSE,
+    'max_installments' => 0,
+  );
+  $form['merchant_code'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Merchant Code'),
+    '#description' => t('Merchant Code from Alphabank'),
+    '#required' => TRUE,
+    '#default_value' => $settings['merchant_code'],
+  );
+  $form['shared_secret_key'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Shared Secret Key'),
+    '#description' => t('Shared Secret Key from Alphabank'),
+    '#required' => TRUE,
+    '#default_value' => $settings['shared_secret_key'],
+  );
+  $form['post_url'] = array(
+    '#type' => 'textfield',
+    '#title' => t('POST Url'),
+    '#description' => t('Url to post data'),
+    '#required' => TRUE,
+    '#default_value' => $settings['post_url'],
+  );
+  $form['transaction_type'] = array(
+    '#type' => 'radios',
+    '#title' => t('Default credit card transaction type'),
+    '#description' => t('The default will be used to process transactions during checkout.'),
+    '#options' => array(
+      COMMERCE_CREDIT_AUTH_CAPTURE => t('Authorisation and capture'),
+      COMMERCE_CREDIT_AUTH_ONLY => t('Authorisation only (requires manual or automated capture after checkout)'),
+    ),
+    '#default_value' => $settings['transaction_type'],
+  );
+  return $form;
+}
+
+/**
+ * Implements hook_redirect_form().
+ */
+function commerce_emporiki_redirect_form($form, &$form_state, $order, $payment_method) {
+  $settings = array();
+
+  // Return an error if the enabling action's settings haven't been configured.
+  if (empty($payment_method['settings']['merchant_code']) ||
+    empty($payment_method['settings']['shared_secret_key']))
+  {
+    drupal_set_message(t('Alphabank Emporiki Payment is not configured. Need to specify Merchant code and Shared secret key.'), 'error');
+    return array();
+  }
+
+  $wrapper = entity_metadata_wrapper('commerce_order', $order);
+  $total = commerce_line_items_total($wrapper->commerce_line_items);
+  $settings['instance_id'] = $payment_method['instance_id'];
+
+  return commerce_emporiki_order_form($form, $form_state, $order, $total, $payment_method['settings'] + $settings);
+}
+
+/**
+ * Creates the Alphabank Form.
+ *
+ * @see https://www.drupal.org/node/1704340
+ */
+function commerce_emporiki_order_form($form, &$form_state, $order, $total, $settings) {
+  // Ensure a default value for the payment_method setting.
+  $settings += array('payment_method' => '');
+
+  // get number of transactions to append on order_id
+  // otherwise possible duplicate order_id if refused and retry
+  $query = new EntityFieldQuery;
+  $result = $query
+    ->entityCondition('entity_type', 'commerce_payment_transaction')
+    ->propertyCondition('order_id', $order->order_id)
+    ->propertyOrderBy('transaction_id', 'DESC')
+    ->execute();
+  $txs = 0;
+  if (isset($result['commerce_payment_transaction']))
+    $txs = count($result['commerce_payment_transaction']);
+
+  // Build the data array that will be translated into hidden form values.
+  $charge = number_format(commerce_currency_amount_to_decimal($total['amount'],
+    $total['currency_code']), 2, ',', '');
+  global $language;
+  $phone = '';
+  $country = 'GR';
+  $state = '';
+  $zip = '';
+  $city = '';
+  $address = '';
+  // @todo weight, dimensions from additional modules
+  if (isset($order->commerce_customer_billing) &&
+    isset($order->commerce_customer_billing['und'][0]))
+  {
+    $profile = commerce_customer_profile_load(
+      $order->commerce_customer_billing['und'][0]['profile_id']);
+    $customer_user = user_load($profile->uid);
+    // @todo add setting for user field phone
+    if (isset($customer_user->field_phone) &&
+      isset($customer_user->field_phone['und'][0]))
+    {
+      $phone = $customer_user->field_phone['und'][0]['value'];
+    }
+    // @todo add setting for user field address (of type addressfield)
+    if (isset($customer_user->field_main_address) &&
+      isset($customer_user->field_main_address['und'][0]))
+    {
+      $country = $customer_user->field_main_address['und'][0]['country'];
+      $state = $customer_user->field_main_address['und'][0]['administrative_area'];
+      $zip = $customer_user->field_main_address['und'][0]['postal_code'];
+      $city = $customer_user->field_main_address['und'][0]['locality'];
+      $address = $customer_user->field_main_address['und'][0]['thoroughfare'];
+    }
+  }
+  $data = array(
+    'mid' => $settings['merchant_code'], // req
+    'lang' => $language->language, // opt
+    'deviceCategory' => 0, // opt
+    'orderid' => 'o' . $order->order_id . 'p' . $txs, // req
+    'orderDesc' => drupal_substr('Purchase from ' . variable_get('site_name'), 0, 128), // opt
+    'orderAmount' => $charge, // req
+    'currency' => $total['currency_code'], // req
+    'payerEmail' => drupal_substr($order->mail, 0, 64), // opt
+    'payerPhone' => drupal_substr($phone, 0, 30), // opt
+    'billCountry' => drupal_substr($country, 0, 2), // opt
+    'billState' => drupal_substr($state, 0, 50), // opt
+    'billZip' => drupal_substr($zip, 0, 16), // opt
+    'billCity' => drupal_substr($city, 0, 64), // opt
+    'billAddress' => drupal_substr($address, 0, 100), // opt
+    'weight' => 0, // opt
+    'dimensions' => 0, // opt
+    'shipCountry' => drupal_substr($country, 0, 2), // opt
+    'shipState' => drupal_substr($state, 0, 50), // opt
+    'shipZip' => drupal_substr($zip, 0, 16), // opt
+    'shipCity' => drupal_substr($city, 0, 64), // opt
+    'shipAddress' => drupal_substr($address, 0, 100), // opt
+    'addFraudScore' => 0, // opt
+    'maxPayRetries' => 0, // opt
+    'reject3dsU' => '', // opt
+    'payMethod' => '', // opt
+    'trType' => ($settings['transaction_type'] == COMMERCE_CREDIT_AUTH_ONLY)? 2: 1, // opt
+    // @todo ask for installments from user
+    'extInstallmentoffset' => '', // opt
+    'extInstallmentperiod' => '', // opt
+    'extRecurringfrequency' => '', // opt
+    'extRecurringenddate' => '', // opt
+    'blockScore' => 0, // opt
+    // @todo specify url setting
+    'cssUrl' => '', // opt
+    'confirmUrl' => url('checkout/emporiki/success', array('absolute' => TRUE)), // req
+    'cancelUrl' => url('checkout/emporiki/fail', array('absolute' => TRUE)), // req
+    'var1' => '', // opt
+    'var2' => '', // opt
+    'var3' => '', // opt
+    'var4' => '', // opt
+    'var5' => '', // opt
+    'digest' => $settings['shared_secret_key'], // temp
+  );
+  $form_data = implode('', $data);
+  $data['digest'] = base64_encode(sha1($form_data, TRUE));
+  $form['#action'] = $settings['post_url'];
+
+  foreach ($data as $name => $value) {
+    $form[$name] = array('#type' => 'hidden', '#value' => $value);
+  }
+
+  $form['submit'] = array(
+    '#type' => 'submit',
+    '#value' => t('Proceed to Alphabank'),
+  );
+
+  return $form;
+}

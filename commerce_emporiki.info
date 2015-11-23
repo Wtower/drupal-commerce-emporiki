@@ -1,0 +1,8 @@
+name = Payment Emporiki
+description = Handles payments with redirection for Alphabank Emporiki.
+package = Commerce Extra
+dependencies[] = commerce
+dependencies[] = commerce_payment
+stylesheets[all][] = css/commerce_emporiki.css
+core = 7.x
+version = "7.x-1.x-dev"
